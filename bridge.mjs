@@ -6,9 +6,7 @@ import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// ───────────────────────────────────────────────────────────────
-// 配置读取
-// ───────────────────────────────────────────────────────────────
+// ====== 配置读取 ======
 function loadEnv(path = resolve(__dirname, '.env')) {
   if (!existsSync(path)) return;
   const text = readFileSync(path, 'utf-8');
@@ -31,9 +29,7 @@ if (!BOT_ID || !BOT_SECRET) {
   process.exit(1);
 }
 
-// ───────────────────────────────────────────────────────────────
-// ANSI 颜色码与边框字符清理工具
-// ───────────────────────────────────────────────────────────────
+// ====== ANSI 颜色码与边框字符清理工具 ======
 const ANSI_PATTERN = /\x1B\[[0-9;]*[mGKHFfnsut]/g;
 const BOX_DRAWING_PATTERN = /[\u2500-\u257F\u2550-\u256C]/g;
 const ORNAMENT_PATTERN = /[\u26a1\u2728\u2b50\u2605\u2606\u25cf\u25cb\u2713\u2714\u2717\u2718]/g;
@@ -54,11 +50,10 @@ function extractHermesReply(raw) {
   const sessionMatch = clean.match(/Resume this session with:\s+hermes --resume\s+(\S+)/);
   const sessionId = sessionMatch ? sessionMatch[1] : null;
 
-  // 提取 Hermes 真正的回复内容（在 Hermes 标题与底部提示之间）
+  // 精确匹配：提取 Hermes 真正的回复内容
   const replyMatch = clean.match(
     /(?:\u2695\s*)?Hermes\s*\n\s*\n([\s\S]*?)\n\s*\n\s*\nResume this session with:/
   );
-
   let reply = replyMatch ? replyMatch[1] : null;
   if (reply) {
     reply = reply
@@ -66,14 +61,33 @@ function extractHermesReply(raw) {
       .map((l) => l.replace(/^(\s{3,})/, ''))
       .join('\n')
       .trim();
+    return { sessionId, reply };
   }
 
-  return { sessionId, reply };
+  // fallback 1：按 "Resume this session with:" 切割，取前面所有内容
+  const resumeIndex = clean.lastIndexOf('Resume this session with:');
+  if (resumeIndex !== -1) {
+    let fallback = clean.slice(0, resumeIndex).trim();
+    // 去掉可能的 Hermes 标题行
+    fallback = fallback.replace(/^(?:\u2695\s*)?Hermes\s*\n+/, '').trim();
+    fallback = fallback
+      .split('\n')
+      .map((l) => l.replace(/^(\s{3,})/, ''))
+      .join('\n')
+      .trim();
+    if (fallback) return { sessionId, reply: fallback };
+  }
+
+  // fallback 2：如果连 "Resume this session with:" 都没有，直接取清理后末尾内容
+  const tail = clean.trim();
+  if (tail) {
+    return { sessionId, reply: tail.slice(-2000) };
+  }
+
+  return { sessionId: null, reply: null };
 }
 
-// ───────────────────────────────────────────────────────────────
-// 会话存储（带过期时间的内存缓存）
-// ───────────────────────────────────────────────────────────────
+// ====== 会话存储（带过期时间的内存缓存） ======
 class SessionStore {
   constructor() {
     this.map = new Map();
@@ -100,9 +114,55 @@ class SessionStore {
 
 const userSessions = new SessionStore();
 
-// ───────────────────────────────────────────────────────────────
-// 调用本地 Hermes CLI
-// ───────────────────────────────────────────────────────────────
+// ====== 用户消息队列（保证同一用户消息串行执行） ======
+const userQueues = new Map();
+
+async function processQueue(userid) {
+  const queue = userQueues.get(userid);
+  if (!queue || queue.processing) return;
+  queue.processing = true;
+  while (queue.length > 0) {
+    const item = queue.shift();
+    try {
+      const result = await callHermes(userid, item.query);
+      item.resolve(result);
+    } catch (err) {
+      item.reject(err);
+    }
+  }
+  queue.processing = false;
+}
+
+function enqueueHermes(userid, query) {
+  return new Promise((resolve, reject) => {
+    if (!userQueues.has(userid)) userQueues.set(userid, []);
+    const queue = userQueues.get(userid);
+    queue.push({ query, resolve, reject });
+    processQueue(userid);
+  });
+}
+
+// ====== 消息去重（短期缓存 60 秒） ======
+const recentMessages = new Map();
+const DEDUP_TTL_MS = 60_000;
+
+function isDuplicate(msgid) {
+  if (!msgid) return false;
+  const ts = recentMessages.get(msgid);
+  if (ts && Date.now() - ts < DEDUP_TTL_MS) return true;
+  recentMessages.set(msgid, Date.now());
+  return false;
+}
+
+// 每 60 秒清理一次过期去重记录
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, ts] of recentMessages) {
+    if (now - ts > DEDUP_TTL_MS) recentMessages.delete(id);
+  }
+}, DEDUP_TTL_MS);
+
+// ====== 调用本地 Hermes CLI ======
 function callHermes(userid, query) {
   return new Promise((resolve, reject) => {
     const sessionId = userSessions.get(userid);
@@ -121,6 +181,10 @@ function callHermes(userid, query) {
 
     const timer = setTimeout(() => {
       child.kill('SIGTERM');
+      // 5 秒后强制终止，防止进程变孤儿进程
+      setTimeout(() => {
+        if (!child.killed) child.kill('SIGKILL');
+      }, 5_000);
       reject(new Error(`Hermes 响应超时，等待了 ${HERMES_TIMEOUT_MS} 毫秒`));
     }, HERMES_TIMEOUT_MS);
 
@@ -138,9 +202,7 @@ function callHermes(userid, query) {
   });
 }
 
-// ───────────────────────────────────────────────────────────────
-// 企业微信 WebSocket 客户端
-// ───────────────────────────────────────────────────────────────
+// ====== 企业微信 WebSocket 客户端 ======
 const wsClient = new WSClient({
   botId: BOT_ID,
   secret: BOT_SECRET,
@@ -160,6 +222,13 @@ wsClient.on('message', async (frame) => {
   const userid = body.from?.userid;
   const content = body.text?.content?.trim();
   if (!userid || !content) return;
+
+  // 去重检查：避免网络抖动导致重复处理
+  const msgid = body.msgid || body.msg_id || `${userid}-${Date.now()}`;
+  if (isDuplicate(msgid)) {
+    console.log(`[${new Date().toISOString()}] 忽略重复消息 ${msgid}`);
+    return;
+  }
 
   console.log(`[${new Date().toISOString()}] 收到消息 from ${userid}: ${content}`);
 
@@ -199,7 +268,7 @@ wsClient.on('message', async (frame) => {
   }
 
   try {
-    const { sessionId, reply } = await callHermes(userid, content);
+    const { sessionId, reply } = await enqueueHermes(userid, content);
     if (sessionId) userSessions.set(userid, sessionId);
 
     // 发送最终回复
@@ -238,5 +307,7 @@ function shutdown() {
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
-console.log(`[${new Date().toISOString()}] 正在连接企业微信机器人 ${BOT_ID}...`);
+// 隐藏启动日志中的完整 Bot ID，只显示尾部四位
+const maskedBotId = BOT_ID.length > 4 ? `***${BOT_ID.slice(-4)}` : '***';
+console.log(`[${new Date().toISOString()}] 正在连接企业微信机器人 ${maskedBotId}...`);
 wsClient.connect();
