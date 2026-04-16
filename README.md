@@ -24,9 +24,11 @@
 ## 功能特性
 
 - 💬 **完整 Hermes 工具能力**：通过企微文字消息调用本地 Agent 的全部工具
+- 🛡️ **调用方白名单鉴权**：仅允许 `ALLOWED_USERIDS` 中的用户触发 Hermes
 - 🔐 **用户级会话记忆**：每个用户独立会话，多轮对话上下文自动保持
 - ⚡ **输入中/缓冲提示**：用户发送消息后，机器人会先提示“Hermes 正在思考...”
 - 🛠️ **自动清理 TUI 输出**：Hermes 的 ANSI 颜色、边框字符、装饰符号在发回微信前自动剥离
+- 🧱 **媒体路径与大小限制**：仅允许发送 `MEDIA_BASE_DIR` 下、白名单后缀且大小受限的图片文件
 - 🔄 **断线自动重连**：WebSocket 掉线后自动恢复，可配置重试次数
 - 📅 **会话自动过期**：内存中的用户会话支持 TTL，过期自动清理
 
@@ -41,7 +43,7 @@
         ↓
 Node.js 桥接服务（本项目）
         ↓
-spawn("hermes", ["chat", "-q", "用户问题", "--yolo"])
+spawn("hermes", ["chat", "-q", "用户问题"])
         ↓
 本地 Hermes Agent（拥有完整本地工具权限）
         ↓
@@ -71,7 +73,7 @@ npm install
 
 # 3. 复制环境变量模板
 cp .env.example .env
-# 编辑 .env，填入 WECOM_BOT_ID 和 WECOM_BOT_SECRET
+# 编辑 .env，至少填入 WECOM_BOT_ID、WECOM_BOT_SECRET、ALLOWED_USERIDS
 ```
 
 ---
@@ -84,9 +86,15 @@ cp .env.example .env
 WECOM_BOT_ID=your_bot_id_here
 WECOM_BOT_SECRET=your_bot_secret_here
 
+# 必填配置：
+ALLOWED_USERIDS=zhangsan,lisi # 允许调用机器人的企业微信用户 ID（逗号分隔）
+
 # 可选配置：
-HERMES_TIMEOUT_MS=300000      # Hermes 最长响应等待时间（毫秒）
-SESSION_TTL_MS=86400000       # 用户会话在内存中的保留时间（毫秒）
+HERMES_TIMEOUT_MS=300000       # Hermes 最长响应等待时间（毫秒）
+SESSION_TTL_MS=86400000        # 用户会话在内存中的保留时间（毫秒）
+HERMES_ENABLE_YOLO=false       # 是否给 Hermes 附加 --yolo（默认 false）
+MEDIA_BASE_DIR=./media         # 允许发送媒体文件的根目录
+MAX_MEDIA_FILE_SIZE_BYTES=10485760 # 媒体文件最大大小（默认 10MB）
 ```
 
 ---
@@ -142,6 +150,8 @@ pm2 save
 | `/help`  | 显示可用命令说明 |
 
 其他所有文字都会直接路由给 Hermes Agent 处理。
+
+如果用户不在 `ALLOWED_USERIDS` 白名单中，机器人会拒绝执行请求并返回“你没有权限使用此机器人”。
 
 ---
 

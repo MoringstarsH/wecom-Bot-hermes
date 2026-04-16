@@ -1,7 +1,7 @@
 import { WSClient, generateReqId } from '@wecom/aibot-node-sdk';
 import { spawn } from 'child_process';
-import { existsSync, readFileSync } from 'fs';
-import { basename, dirname, resolve } from 'path';
+import { existsSync, readFileSync, statSync } from 'fs';
+import { basename, dirname, extname, isAbsolute, relative, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -21,11 +21,60 @@ loadEnv();
 
 const BOT_ID = process.env.WECOM_BOT_ID || '';
 const BOT_SECRET = process.env.WECOM_BOT_SECRET || '';
-const HERMES_TIMEOUT_MS = Number(process.env.HERMES_TIMEOUT_MS || 300_000);
-const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 24 * 60 * 60 * 1000);
+function parseBoolean(value, fallback = false) {
+  if (value == null || value === '') return fallback;
+  const normalized = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  return fallback;
+}
+
+function parsePositiveInt(name, fallback, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < min || n > max) {
+    console.warn(
+      `[配置警告] ${name}=${raw} 非法，回退为 ${fallback}（允许范围: ${min}~${max}）`
+    );
+    return fallback;
+  }
+  return n;
+}
+
+function parseCsvToSet(value) {
+  return new Set(
+    String(value || '')
+      .split(',')
+      .map((v) => v.trim())
+      .filter(Boolean)
+  );
+}
+
+const HERMES_TIMEOUT_MS = parsePositiveInt('HERMES_TIMEOUT_MS', 300_000, {
+  min: 1_000,
+  max: 30 * 60 * 1000,
+});
+const SESSION_TTL_MS = parsePositiveInt('SESSION_TTL_MS', 24 * 60 * 60 * 1000, {
+  min: 60_000,
+  max: 30 * 24 * 60 * 60 * 1000,
+});
+const ALLOWED_USERIDS = parseCsvToSet(process.env.ALLOWED_USERIDS);
+const HERMES_ENABLE_YOLO = parseBoolean(process.env.HERMES_ENABLE_YOLO, false);
+const MEDIA_BASE_DIR = resolve(__dirname, process.env.MEDIA_BASE_DIR || './media');
+const MAX_MEDIA_FILE_SIZE_BYTES = parsePositiveInt('MAX_MEDIA_FILE_SIZE_BYTES', 10 * 1024 * 1024, {
+  min: 1_024,
+  max: 50 * 1024 * 1024,
+});
+const ALLOWED_MEDIA_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
 
 if (!BOT_ID || !BOT_SECRET) {
   console.error('缺少环境变量 WECOM_BOT_ID 或 WECOM_BOT_SECRET');
+  process.exit(1);
+}
+
+if (ALLOWED_USERIDS.size === 0) {
+  console.error('缺少环境变量 ALLOWED_USERIDS，必须配置允许调用机器人的用户列表');
   process.exit(1);
 }
 
@@ -41,6 +90,56 @@ function stripFormatting(str) {
     .replace(BOX_DRAWING_PATTERN, '')
     .replace(ORNAMENT_PATTERN, '')
     .replace(BRAILLE_BLANK, ' ');
+}
+
+function isAuthorizedUser(userid) {
+  return ALLOWED_USERIDS.has(userid);
+}
+
+function isPathInside(baseDir, targetPath) {
+  const rel = relative(baseDir, targetPath);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
+function validateMediaPath(rawPath) {
+  const absPath = resolve(__dirname, rawPath);
+  if (!existsSync(absPath)) {
+    console.log(`[跳过不存在的路径] ${rawPath}`);
+    return null;
+  }
+
+  let stat;
+  try {
+    stat = statSync(absPath);
+  } catch (err) {
+    console.log(`[跳过不可读取的路径] ${rawPath}: ${err.message}`);
+    return null;
+  }
+
+  if (!stat.isFile()) {
+    console.log(`[跳过非文件路径] ${rawPath}`);
+    return null;
+  }
+
+  if (!isPathInside(MEDIA_BASE_DIR, absPath)) {
+    console.log(`[跳过越界媒体路径] ${absPath}`);
+    return null;
+  }
+
+  const ext = extname(absPath).toLowerCase();
+  if (!ALLOWED_MEDIA_EXTENSIONS.has(ext)) {
+    console.log(`[跳过不支持的媒体格式] ${absPath}`);
+    return null;
+  }
+
+  if (stat.size > MAX_MEDIA_FILE_SIZE_BYTES) {
+    console.log(
+      `[跳过过大媒体文件] ${absPath} (${stat.size} bytes > ${MAX_MEDIA_FILE_SIZE_BYTES} bytes)`
+    );
+    return null;
+  }
+
+  return absPath;
 }
 
 // ====== 从完整清理输出中提取 MEDIA: 路径（支持折行拼接） ======
@@ -64,11 +163,8 @@ function extractMediaPaths(cleanText) {
       }
     }
 
-    if (existsSync(path)) {
-      paths.push(path);
-    } else {
-      console.log(`[跳过不存在的路径] ${path}`);
-    }
+    const validatedPath = validateMediaPath(path);
+    if (validatedPath) paths.push(validatedPath);
   }
 
   return paths;
@@ -202,13 +298,21 @@ setInterval(() => {
   }
 }, DEDUP_TTL_MS);
 
+class HermesBridgeError extends Error {
+  constructor(userMessage, logDetail = '') {
+    super(userMessage);
+    this.name = 'HermesBridgeError';
+    this.userMessage = userMessage;
+    this.logDetail = logDetail || userMessage;
+  }
+}
+
 // ====== 调用本地 Hermes CLI ======
 function callHermes(userid, query) {
   return new Promise((resolve, reject) => {
     const sessionId = userSessions.get(userid);
-    const args = sessionId
-      ? ['--resume', sessionId, 'chat', '-q', query, '--yolo']
-      : ['chat', '-q', query, '--yolo'];
+    const args = sessionId ? ['--resume', sessionId, 'chat', '-q', query] : ['chat', '-q', query];
+    if (HERMES_ENABLE_YOLO) args.push('--yolo');
 
     const child = spawn('hermes', args, {
       env: { ...process.env, NO_COLOR: '1' },
@@ -224,8 +328,23 @@ function callHermes(userid, query) {
       setTimeout(() => {
         if (!child.killed) child.kill('SIGKILL');
       }, 5_000);
-      reject(new Error(`Hermes 响应超时，等待了 ${HERMES_TIMEOUT_MS} 毫秒`));
+      reject(
+        new HermesBridgeError(
+          'Hermes 响应超时，请稍后重试。',
+          `Hermes timeout after ${HERMES_TIMEOUT_MS}ms for user ${userid}`
+        )
+      );
     }, HERMES_TIMEOUT_MS);
+
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      reject(
+        new HermesBridgeError(
+          'Hermes 服务不可用，请联系管理员。',
+          `Hermes spawn error for user ${userid}: ${err.message}`
+        )
+      );
+    });
 
     child.on('close', (code) => {
       clearTimeout(timer);
@@ -235,7 +354,12 @@ function callHermes(userid, query) {
         resolve({ sessionId: sid, reply, mediaPaths });
       } else {
         const tail = stdout.slice(-800).trim();
-        reject(new Error(`无法解析 Hermes 回复，退出码: ${code}。末尾原始输出:\n${tail}`));
+        reject(
+          new HermesBridgeError(
+            'Hermes 返回异常，请稍后重试。',
+            `Parse failure (exit code: ${code}) for user ${userid}. Output tail:\n${tail}`
+          )
+        );
       }
     });
   });
@@ -251,7 +375,7 @@ async function sendMediaReplies(ws, frame, mediaPaths) {
       await ws.replyMedia(frame, 'image', result.media_id);
     } catch (e) {
       console.error('发送图片失败:', path, e.message);
-      await ws.replyStream(frame, generateReqId('stream'), `【图片发送失败: ${path}】`, true);
+      await ws.replyStream(frame, generateReqId('stream'), '【图片发送失败】', true);
     }
   }
 }
@@ -276,6 +400,16 @@ wsClient.on('message', async (frame) => {
   const userid = body.from?.userid;
   const content = body.text?.content?.trim();
   if (!userid || !content) return;
+
+  if (!isAuthorizedUser(userid)) {
+    console.warn(`[${new Date().toISOString()}] 拒绝未授权用户: ${userid}`);
+    try {
+      await wsClient.replyStream(frame, generateReqId('stream'), '你没有权限使用此机器人。', true);
+    } catch (e) {
+      console.error('未授权提示发送失败:', e.message);
+    }
+    return;
+  }
 
   // 去重检查：避免网络抖动导致重复处理
   const msgid = body.msgid || body.msg_id || `${userid}-${Date.now()}`;
@@ -335,12 +469,14 @@ wsClient.on('message', async (frame) => {
       await sendMediaReplies(wsClient, frame, mediaPaths);
     }
   } catch (err) {
-    console.error('Hermes 调用错误:', err.message);
+    const userMessage = err?.userMessage || '服务暂时不可用，请稍后重试。';
+    const logDetail = err?.logDetail || err?.stack || err?.message || String(err);
+    console.error('Hermes 调用错误:', logDetail);
     try {
       await wsClient.replyStream(
         frame,
         generateReqId('stream'),
-        `出错了: ${err.message}\n\n小贴士: 发送 "/clear" 可以重置会话。`,
+        `${userMessage}\n\n小贴士: 发送 "/clear" 可以重置会话。`,
         true
       );
     } catch (e) {
@@ -371,4 +507,7 @@ process.on('SIGTERM', shutdown);
 // 隐藏启动日志中的完整 Bot ID，只显示尾部四位
 const maskedBotId = BOT_ID.length > 4 ? `***${BOT_ID.slice(-4)}` : '***';
 console.log(`[${new Date().toISOString()}] 正在连接企业微信机器人 ${maskedBotId}...`);
+console.log(
+  `[${new Date().toISOString()}] 安全配置: allowlist=${ALLOWED_USERIDS.size}, yolo=${HERMES_ENABLE_YOLO}, mediaBaseDir=${MEDIA_BASE_DIR}`
+);
 wsClient.connect();
