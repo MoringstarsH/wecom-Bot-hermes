@@ -43,8 +43,50 @@ function stripFormatting(str) {
     .replace(BRAILLE_BLANK, ' ');
 }
 
+// ====== 从完整清理输出中提取 MEDIA: 路径（支持折行拼接） ======
+function extractMediaPaths(cleanText) {
+  const paths = [];
+  const lines = cleanText.split('\n');
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    const idx = line.indexOf('MEDIA:');
+    if (idx === -1) continue;
+
+    let path = line.slice(idx + 6).trim();
+
+    // 如果当前行没有以常见扩展名结尾，尝试把下一行非 MEDIA 开头的内容拼上来
+    const hasExt = /\.(png|jpg|jpeg|gif|webp|bmp|mp4|mov|pdf)$/i.test(path);
+    if (!hasExt && i + 1 < lines.length) {
+      const nextLine = lines[i + 1].trim();
+      if (nextLine && !nextLine.startsWith('MEDIA:')) {
+        path += nextLine;
+      }
+    }
+
+    if (existsSync(path)) {
+      paths.push(path);
+    } else {
+      console.log(`[跳过不存在的路径] ${path}`);
+    }
+  }
+
+  return paths;
+}
+
+// ====== 移除 MEDIA: 标记并清理多余空行 ======
+function removeMediaMarkers(text) {
+  return text
+    .replace(/MEDIA:[^\s\n]+(\n(?![A-Z]|\n)[^\s\n]+)?/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 function extractHermesReply(raw) {
   const clean = stripFormatting(raw);
+
+  // 从完整输出中提取所有 MEDIA: 路径
+  const mediaPaths = extractMediaPaths(clean);
 
   // 提取会话 ID（用于多轮对话记忆）
   const sessionMatch = clean.match(/Resume this session with:\s+hermes --resume\s+(\S+)/);
@@ -61,7 +103,7 @@ function extractHermesReply(raw) {
       .map((l) => l.replace(/^(\s{3,})/, ''))
       .join('\n')
       .trim();
-    return { sessionId, reply };
+    return { sessionId, reply: removeMediaMarkers(reply), mediaPaths };
   }
 
   // fallback 1：按 "Resume this session with:" 切割，取前面所有内容
@@ -74,28 +116,16 @@ function extractHermesReply(raw) {
       .map((l) => l.replace(/^(\s{3,})/, ''))
       .join('\n')
       .trim();
-    if (fallback) return { sessionId, reply: fallback };
+    if (fallback) return { sessionId, reply: removeMediaMarkers(fallback), mediaPaths };
   }
 
   // fallback 2：如果连 "Resume this session with:" 都没有，直接取清理后末尾内容
   const tail = clean.trim();
   if (tail) {
-    return { sessionId, reply: tail.slice(-2000) };
+    return { sessionId, reply: removeMediaMarkers(tail.slice(-2000)), mediaPaths };
   }
 
-  return { sessionId: null, reply: null };
-}
-
-// ====== 从回复中提取 MEDIA: 图片路径 ======
-function extractMediaPaths(text) {
-  const mediaPaths = [];
-  const cleaned = text.replace(/MEDIA:([^\s\n]+)/g, (match, p1) => {
-    if (existsSync(p1)) mediaPaths.push(p1);
-    return '';
-  });
-  // 清理因移除 MEDIA 产生的多余空行
-  const finalText = cleaned.replace(/\n{3,}/g, '\n\n').trim();
-  return { text: finalText, mediaPaths };
+  return { sessionId: null, reply: null, mediaPaths };
 }
 
 // ====== 会话存储（带过期时间的内存缓存） ======
@@ -199,10 +229,10 @@ function callHermes(userid, query) {
 
     child.on('close', (code) => {
       clearTimeout(timer);
-      const { sessionId: sid, reply } = extractHermesReply(stdout);
+      const { sessionId: sid, reply, mediaPaths } = extractHermesReply(stdout);
 
-      if (reply) {
-        resolve({ sessionId: sid, reply });
+      if (reply || mediaPaths.length > 0) {
+        resolve({ sessionId: sid, reply, mediaPaths });
       } else {
         const tail = stdout.slice(-800).trim();
         reject(new Error(`无法解析 Hermes 回复，退出码: ${code}。末尾原始输出:\n${tail}`));
@@ -221,8 +251,7 @@ async function sendMediaReplies(ws, frame, mediaPaths) {
       await ws.replyMedia(frame, 'image', result.media_id);
     } catch (e) {
       console.error('发送图片失败:', path, e.message);
-      // 如果上传失败，回退为文字提示
-      await ws.replyStream(frame, generateReqId('stream'), `[图片发送失败: ${path}]`, true);
+      await ws.replyStream(frame, generateReqId('stream'), `【图片发送失败: ${path}】`, true);
     }
   }
 }
@@ -293,14 +322,12 @@ wsClient.on('message', async (frame) => {
   }
 
   try {
-    const { sessionId, reply } = await enqueueHermes(userid, content);
+    const { sessionId, reply, mediaPaths } = await enqueueHermes(userid, content);
     if (sessionId) userSessions.set(userid, sessionId);
 
-    const { text, mediaPaths } = extractMediaPaths(reply);
-
     // 先发送文字部分（如果有）
-    if (text) {
-      await wsClient.replyStream(frame, generateReqId('stream'), text, true);
+    if (reply) {
+      await wsClient.replyStream(frame, generateReqId('stream'), reply, true);
     }
 
     // 再发送图片（如果有）
