@@ -3,6 +3,7 @@ import { spawn } from 'child_process';
 import { existsSync, readFileSync, statSync } from 'fs';
 import { basename, dirname, extname, isAbsolute, relative, resolve } from 'path';
 import { fileURLToPath } from 'url';
+import { homedir } from 'os';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -21,6 +22,7 @@ loadEnv();
 
 const BOT_ID = process.env.WECOM_BOT_ID || '';
 const BOT_SECRET = process.env.WECOM_BOT_SECRET || '';
+
 function parseBoolean(value, fallback = false) {
   if (value == null || value === '') return fallback;
   const normalized = String(value).trim().toLowerCase();
@@ -61,12 +63,14 @@ const SESSION_TTL_MS = parsePositiveInt('SESSION_TTL_MS', 24 * 60 * 60 * 1000, {
 });
 const ALLOWED_USERIDS = parseCsvToSet(process.env.ALLOWED_USERIDS);
 const HERMES_ENABLE_YOLO = parseBoolean(process.env.HERMES_ENABLE_YOLO, false);
-const MEDIA_BASE_DIR = resolve(__dirname, process.env.MEDIA_BASE_DIR || './media');
+const DEFAULT_MEDIA_BASE = resolve(homedir(), '.hermes', 'cache', 'screenshots');
+const MEDIA_BASE_DIR = resolve(process.env.MEDIA_BASE_DIR || DEFAULT_MEDIA_BASE);
 const MAX_MEDIA_FILE_SIZE_BYTES = parsePositiveInt('MAX_MEDIA_FILE_SIZE_BYTES', 10 * 1024 * 1024, {
   min: 1_024,
   max: 50 * 1024 * 1024,
 });
 const ALLOWED_MEDIA_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
+const MAX_GLOBAL_CONCURRENCY = parsePositiveInt('MAX_GLOBAL_CONCURRENCY', 15, { min: 1, max: 50 });
 
 if (!BOT_ID || !BOT_SECRET) {
   console.error('缺少环境变量 WECOM_BOT_ID 或 WECOM_BOT_SECRET');
@@ -172,10 +176,24 @@ function extractMediaPaths(cleanText) {
 
 // ====== 移除 MEDIA: 标记并清理多余空行 ======
 function removeMediaMarkers(text) {
-  return text
-    .replace(/MEDIA:[^\s\n]+(\n(?![A-Z]|\n)[^\s\n]+)?/g, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+  const lines = text.split('\n');
+  const result = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (line.includes('MEDIA:')) {
+      const pathPart = line.slice(line.indexOf('MEDIA:') + 6).trim();
+      const hasExt = /\.(png|jpg|jpeg|gif|webp|bmp|mp4|mov|pdf)$/i.test(pathPart);
+      if (!hasExt && i + 1 < lines.length) {
+        const nextLine = lines[i + 1].trim();
+        if (nextLine && !nextLine.startsWith('MEDIA:')) {
+          i++; // 跳过折行的下一行
+        }
+      }
+      continue;
+    }
+    result.push(lines[i]);
+  }
+  return result.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 function extractHermesReply(raw) {
@@ -251,6 +269,30 @@ class SessionStore {
 
 const userSessions = new SessionStore();
 
+// ====== 全局并发控制（限制同时运行的 Hermes 进程数量） ======
+let activeGlobalCount = 0;
+const globalWaitQueue = [];
+
+function acquireGlobalSlot() {
+  return new Promise((resolve) => {
+    if (activeGlobalCount < MAX_GLOBAL_CONCURRENCY) {
+      activeGlobalCount++;
+      resolve();
+    } else {
+      globalWaitQueue.push(resolve);
+    }
+  });
+}
+
+function releaseGlobalSlot() {
+  activeGlobalCount--;
+  if (globalWaitQueue.length > 0) {
+    const next = globalWaitQueue.shift();
+    activeGlobalCount++;
+    next();
+  }
+}
+
 // ====== 用户消息队列（保证同一用户消息串行执行） ======
 const userQueues = new Map();
 
@@ -260,21 +302,44 @@ async function processQueue(userid) {
   queue.processing = true;
   while (queue.length > 0) {
     const item = queue.shift();
+    let notifiedWaiting = false;
     try {
+      // 全局并发控制 + 排队提示
+      if (activeGlobalCount >= MAX_GLOBAL_CONCURRENCY) {
+        await item.context.ws.replyStream(
+          item.context.frame,
+          generateReqId('stream'),
+          '当前请求较多，正在排队，请稍候...',
+          true
+        );
+        notifiedWaiting = true;
+      }
+      await acquireGlobalSlot();
+      if (notifiedWaiting) {
+        await item.context.ws.replyStream(
+          item.context.frame,
+          generateReqId('stream'),
+          '排队到你啦，正在做你的请求...',
+          false
+        );
+      }
+
       const result = await callHermes(userid, item.query);
       item.resolve(result);
     } catch (err) {
       item.reject(err);
+    } finally {
+      releaseGlobalSlot();
     }
   }
   queue.processing = false;
 }
 
-function enqueueHermes(userid, query) {
+function enqueueHermes(userid, query, context) {
   return new Promise((resolve, reject) => {
     if (!userQueues.has(userid)) userQueues.set(userid, []);
     const queue = userQueues.get(userid);
-    queue.push({ query, resolve, reject });
+    queue.push({ query, resolve, reject, context });
     processQueue(userid);
   });
 }
@@ -282,11 +347,17 @@ function enqueueHermes(userid, query) {
 // ====== 消息去重（短期缓存 60 秒） ======
 const recentMessages = new Map();
 const DEDUP_TTL_MS = 60_000;
+const MAX_DEDUP_SIZE = 5_000;
 
 function isDuplicate(msgid) {
   if (!msgid) return false;
   const ts = recentMessages.get(msgid);
   if (ts && Date.now() - ts < DEDUP_TTL_MS) return true;
+  // 防止无限膨胀
+  if (recentMessages.size >= MAX_DEDUP_SIZE) {
+    const firstKey = recentMessages.keys().next().value;
+    if (firstKey !== undefined) recentMessages.delete(firstKey);
+  }
   recentMessages.set(msgid, Date.now());
   return false;
 }
@@ -456,7 +527,10 @@ wsClient.on('message', async (frame) => {
   }
 
   try {
-    const { sessionId, reply, mediaPaths } = await enqueueHermes(userid, content);
+    const { sessionId, reply, mediaPaths } = await enqueueHermes(userid, content, {
+      ws: wsClient,
+      frame,
+    });
     if (sessionId) userSessions.set(userid, sessionId);
 
     // 先发送文字部分（如果有）
@@ -508,6 +582,6 @@ process.on('SIGTERM', shutdown);
 const maskedBotId = BOT_ID.length > 4 ? `***${BOT_ID.slice(-4)}` : '***';
 console.log(`[${new Date().toISOString()}] 正在连接企业微信机器人 ${maskedBotId}...`);
 console.log(
-  `[${new Date().toISOString()}] 安全配置: allowlist=${ALLOWED_USERIDS.size}, yolo=${HERMES_ENABLE_YOLO}, mediaBaseDir=${MEDIA_BASE_DIR}`
+  `[${new Date().toISOString()}] 安全配置: allowlist=${ALLOWED_USERIDS.size}, yolo=${HERMES_ENABLE_YOLO}, mediaBaseDir=${MEDIA_BASE_DIR}, maxConcurrency=${MAX_GLOBAL_CONCURRENCY}`
 );
 wsClient.connect();
