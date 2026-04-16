@@ -9,3 +9,5 @@ yarn-error.log*
 .idea/
 logs/
 *.pid
+received_images/
+users.json

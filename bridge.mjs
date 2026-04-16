@@ -1,9 +1,10 @@
 import { WSClient, generateReqId } from '@wecom/aibot-node-sdk';
 import { spawn } from 'child_process';
-import { existsSync, readFileSync, statSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'fs';
 import { basename, dirname, extname, isAbsolute, relative, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir } from 'os';
+import { randomBytes } from 'crypto';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -77,9 +78,59 @@ if (!BOT_ID || !BOT_SECRET) {
   process.exit(1);
 }
 
-if (ALLOWED_USERIDS.size === 0) {
-  console.error('缺少环境变量 ALLOWED_USERIDS，必须配置允许调用机器人的用户列表');
-  process.exit(1);
+// ====== 动态用户权限管理（users.json） ======
+const USERS_FILE = resolve(__dirname, 'users.json');
+
+function generatePairingCode() {
+  return randomBytes(4).toString('hex').toUpperCase().slice(0, 6);
+}
+
+let usersData = { admins: [], approved: [], pending: {} };
+
+function loadUsers() {
+  if (!existsSync(USERS_FILE)) {
+    usersData = {
+      admins: Array.from(ALLOWED_USERIDS),
+      approved: [],
+      pending: {},
+    };
+    saveUsers();
+    return;
+  }
+  try {
+    const raw = JSON.parse(readFileSync(USERS_FILE, 'utf-8'));
+    usersData = {
+      admins: Array.isArray(raw.admins) ? raw.admins : [],
+      approved: Array.isArray(raw.approved) ? raw.approved : [],
+      pending: typeof raw.pending === 'object' && raw.pending !== null ? raw.pending : {},
+    };
+  } catch (err) {
+    console.error('加载 users.json 失败，使用默认管理员列表:', err.message);
+    usersData = {
+      admins: Array.from(ALLOWED_USERIDS),
+      approved: [],
+      pending: {},
+    };
+    saveUsers();
+  }
+}
+
+function saveUsers() {
+  try {
+    writeFileSync(USERS_FILE, JSON.stringify(usersData, null, 2));
+  } catch (err) {
+    console.error('保存 users.json 失败:', err.message);
+  }
+}
+
+loadUsers();
+
+function isAdmin(userid) {
+  return usersData.admins.includes(userid);
+}
+
+function isAuthorizedUser(userid) {
+  return isAdmin(userid) || usersData.approved.includes(userid);
 }
 
 // ====== ANSI 颜色码与边框字符清理工具 ======
@@ -94,10 +145,6 @@ function stripFormatting(str) {
     .replace(BOX_DRAWING_PATTERN, '')
     .replace(ORNAMENT_PATTERN, '')
     .replace(BRAILLE_BLANK, ' ');
-}
-
-function isAuthorizedUser(userid) {
-  return ALLOWED_USERIDS.has(userid);
 }
 
 function isPathInside(baseDir, targetPath) {
@@ -158,7 +205,6 @@ function extractMediaPaths(cleanText) {
 
     let path = line.slice(idx + 6).trim();
 
-    // 如果当前行没有以常见扩展名结尾，尝试把下一行非 MEDIA 开头的内容拼上来
     const hasExt = /\.(png|jpg|jpeg|gif|webp|bmp|mp4|mov|pdf)$/i.test(path);
     if (!hasExt && i + 1 < lines.length) {
       const nextLine = lines[i + 1].trim();
@@ -186,7 +232,7 @@ function removeMediaMarkers(text) {
       if (!hasExt && i + 1 < lines.length) {
         const nextLine = lines[i + 1].trim();
         if (nextLine && !nextLine.startsWith('MEDIA:')) {
-          i++; // 跳过折行的下一行
+          i++;
         }
       }
       continue;
@@ -198,15 +244,11 @@ function removeMediaMarkers(text) {
 
 function extractHermesReply(raw) {
   const clean = stripFormatting(raw);
-
-  // 从完整输出中提取所有 MEDIA: 路径
   const mediaPaths = extractMediaPaths(clean);
 
-  // 提取会话 ID（用于多轮对话记忆）
   const sessionMatch = clean.match(/Resume this session with:\s+hermes --resume\s+(\S+)/);
   const sessionId = sessionMatch ? sessionMatch[1] : null;
 
-  // 精确匹配：提取 Hermes 真正的回复内容
   const replyMatch = clean.match(
     /(?:\u2695\s*)?Hermes\s*\n\s*\n([\s\S]*?)\n\s*\n\s*\nResume this session with:/
   );
@@ -220,7 +262,6 @@ function extractHermesReply(raw) {
     return { sessionId, reply: removeMediaMarkers(reply), mediaPaths };
   }
 
-  // fallback 1：按 "Resume this session with:" 切割，取前面所有内容
   const resumeIndex = clean.lastIndexOf('Resume this session with:');
   if (resumeIndex !== -1) {
     let fallback = clean.slice(0, resumeIndex).trim();
@@ -233,7 +274,6 @@ function extractHermesReply(raw) {
     if (fallback) return { sessionId, reply: removeMediaMarkers(fallback), mediaPaths };
   }
 
-  // fallback 2：如果连 "Resume this session with:" 都没有，直接取清理后末尾内容
   const tail = clean.trim();
   if (tail) {
     return { sessionId, reply: removeMediaMarkers(tail.slice(-2000)), mediaPaths };
@@ -268,6 +308,24 @@ class SessionStore {
 }
 
 const userSessions = new SessionStore();
+
+// ====== 用户最近图片缓存（用于图文上下文） ======
+const userLastImages = new Map();
+const IMAGE_CONTEXT_TTL_MS = 10 * 60 * 1000;
+
+function setUserLastImage(userid, path) {
+  userLastImages.set(userid, { path, ts: Date.now() });
+}
+
+function getUserLastImage(userid) {
+  const rec = userLastImages.get(userid);
+  if (!rec) return null;
+  if (Date.now() - rec.ts > IMAGE_CONTEXT_TTL_MS) {
+    userLastImages.delete(userid);
+    return null;
+  }
+  return rec.path;
+}
 
 // ====== 全局并发控制（限制同时运行的 Hermes 进程数量） ======
 let activeGlobalCount = 0;
@@ -304,7 +362,6 @@ async function processQueue(userid) {
     const item = queue.shift();
     let notifiedWaiting = false;
     try {
-      // 全局并发控制 + 排队提示
       if (activeGlobalCount >= MAX_GLOBAL_CONCURRENCY) {
         await item.context.ws.replyStream(
           item.context.frame,
@@ -353,7 +410,6 @@ function isDuplicate(msgid) {
   if (!msgid) return false;
   const ts = recentMessages.get(msgid);
   if (ts && Date.now() - ts < DEDUP_TTL_MS) return true;
-  // 防止无限膨胀
   if (recentMessages.size >= MAX_DEDUP_SIZE) {
     const firstKey = recentMessages.keys().next().value;
     if (firstKey !== undefined) recentMessages.delete(firstKey);
@@ -466,21 +522,8 @@ wsClient.on('authenticated', () => {
 
 wsClient.on('message', async (frame) => {
   const body = frame.body;
-  if (body.msgtype !== 'text') return;
-
   const userid = body.from?.userid;
-  const content = body.text?.content?.trim();
-  if (!userid || !content) return;
-
-  if (!isAuthorizedUser(userid)) {
-    console.warn(`[${new Date().toISOString()}] 拒绝未授权用户: ${userid}`);
-    try {
-      await wsClient.replyStream(frame, generateReqId('stream'), '你没有权限使用此机器人。', true);
-    } catch (e) {
-      console.error('未授权提示发送失败:', e.message);
-    }
-    return;
-  }
+  if (!userid) return;
 
   // 去重检查：避免网络抖动导致重复处理
   const msgid = body.msgid || body.msg_id || `${userid}-${Date.now()}`;
@@ -489,11 +532,118 @@ wsClient.on('message', async (frame) => {
     return;
   }
 
+  // ====== 动态配对：未授权用户 ======
+  if (!isAuthorizedUser(userid)) {
+    let code = usersData.pending[userid];
+    if (!code) {
+      code = generatePairingCode();
+      usersData.pending[userid] = code;
+      saveUsers();
+    }
+    console.warn(`[${new Date().toISOString()}] 未授权用户请求配对: ${userid}, code=${code}`);
+    try {
+      await wsClient.replyStream(
+        frame,
+        generateReqId('stream'),
+        `你还没有权限使用此机器人。\n\n配对码：${code}\n请让管理员发送 /approve ${code} 来授权你。`,
+        true
+      );
+    } catch (e) {
+      console.error('配对提示发送失败:', e.message);
+    }
+    return;
+  }
+
+  // ====== 管理员审批命令 ======
+  if (body.msgtype === 'text') {
+    const content = body.text?.content?.trim() || '';
+    if (content.startsWith('/approve ')) {
+      if (!isAdmin(userid)) {
+        try {
+          await wsClient.replyStream(frame, generateReqId('stream'), '只有管理员可以执行审批。', true);
+        } catch (e) {
+          console.error('审批权限提示失败:', e.message);
+        }
+        return;
+      }
+      const code = content.replace('/approve ', '').trim().toUpperCase();
+      const entry = Object.entries(usersData.pending).find(([_, c]) => c === code);
+      if (entry) {
+        const [approvedUser, approvedCode] = entry;
+        delete usersData.pending[approvedUser];
+        usersData.approved.push(approvedUser);
+        saveUsers();
+        console.log(`[${new Date().toISOString()}] 管理员 ${userid} 审批通过: ${approvedUser}, code=${approvedCode}`);
+        try {
+          await wsClient.replyStream(
+            frame,
+            generateReqId('stream'),
+            `已批准用户 ${approvedUser} 使用机器人。`,
+            true
+          );
+        } catch (e) {
+          console.error('审批成功回复失败:', e.message);
+        }
+      } else {
+        try {
+          await wsClient.replyStream(
+            frame,
+            generateReqId('stream'),
+            `未找到配对码 ${code}，可能已经过期或被批准。`,
+            true
+          );
+        } catch (e) {
+          console.error('审批失败回复失败:', e.message);
+        }
+      }
+      return;
+    }
+  }
+
+  // ====== 处理图片消息 ======
+  if (body.msgtype === 'image') {
+    const imageUrl = body.image?.url;
+    const aesKey = body.image?.aeskey;
+    if (!imageUrl || !aesKey) {
+      try {
+        await wsClient.replyStream(frame, generateReqId('stream'), '图片信息不完整，无法下载。', true);
+      } catch (e) {
+        console.error('图片提示发送失败:', e.message);
+      }
+      return;
+    }
+    try {
+      const { buffer, filename } = await wsClient.downloadFile(imageUrl, aesKey);
+      const saveDir = resolve(__dirname, 'received_images');
+      mkdirSync(saveDir, { recursive: true });
+      const saveName = filename ? `${Date.now()}_${filename}` : `${Date.now()}_image.png`;
+      const savePath = resolve(saveDir, saveName);
+      writeFileSync(savePath, buffer);
+      setUserLastImage(userid, savePath);
+      console.log(`[${new Date().toISOString()}] 保存图片 from ${userid}: ${savePath}`);
+      await wsClient.replyStream(frame, generateReqId('stream'), '图片已收到并保存，请继续发送文字指令处理它。', true);
+    } catch (e) {
+      console.error('保存图片失败:', e.message);
+      try {
+        await wsClient.replyStream(frame, generateReqId('stream'), '图片保存失败，请重试。', true);
+      } catch (err) {
+        console.error('图片失败提示发送失败:', err.message);
+      }
+    }
+    return;
+  }
+
+  // ====== 处理文字消息 ======
+  if (body.msgtype !== 'text') return;
+  const content = body.text?.content?.trim();
+  if (!content) return;
+
   console.log(`[${new Date().toISOString()}] 收到消息 from ${userid}: ${content}`);
 
   // /clear 命令：清空用户会话
   if (content === '/clear') {
     userSessions.delete(userid);
+    userLastImages.delete(userid);
     try {
       await wsClient.replyStream(frame, generateReqId('stream'), '会话已清空，重新开始聊天！', true);
     } catch (e) {
@@ -523,11 +673,16 @@ wsClient.on('message', async (frame) => {
   try {
     await wsClient.replyStream(frame, generateReqId('stream'), ' Hermes 正在思考... ', false);
   } catch (e) {
-    // 非致命错误；部分 SDK 版本可能对流式分片支持不是很好
+    // 非致命错误
   }
 
   try {
-    const { sessionId, reply, mediaPaths } = await enqueueHermes(userid, content, {
+    let query = content;
+    const lastImagePath = getUserLastImage(userid);
+    if (lastImagePath) {
+      query = `[系统提示：用户刚刚发送了一张图片，本地保存路径为: ${lastImagePath}]\n用户的指令：${content}`;
+    }
+    const { sessionId, reply, mediaPaths } = await enqueueHermes(userid, query, {
       ws: wsClient,
       frame,
     });
@@ -582,6 +737,6 @@ process.on('SIGTERM', shutdown);
 const maskedBotId = BOT_ID.length > 4 ? `***${BOT_ID.slice(-4)}` : '***';
 console.log(`[${new Date().toISOString()}] 正在连接企业微信机器人 ${maskedBotId}...`);
 console.log(
-  `[${new Date().toISOString()}] 安全配置: allowlist=${ALLOWED_USERIDS.size}, yolo=${HERMES_ENABLE_YOLO}, mediaBaseDir=${MEDIA_BASE_DIR}, maxConcurrency=${MAX_GLOBAL_CONCURRENCY}`
+  `[${new Date().toISOString()}] 安全配置: admins=${usersData.admins.length}, approved=${usersData.approved.length}, pending=${Object.keys(usersData.pending).length}, yolo=${HERMES_ENABLE_YOLO}, mediaBaseDir=${MEDIA_BASE_DIR}, maxConcurrency=${MAX_GLOBAL_CONCURRENCY}`
 );
 wsClient.connect();
