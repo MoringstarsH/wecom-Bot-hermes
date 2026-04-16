@@ -1,129 +1,129 @@
-# WeCom Bot → Hermes Bridge
+# 企业微信机器人 → Hermes 本地桥接
 
-A lightweight Node.js bridge that connects a **WeCom Smart Bot (智能机器人）** directly to the local **Hermes Agent CLI**. Every WeChat user gets full access to Hermes' local toolset: terminal, file operations, browser automation, skills, cron, etc.
+轻量级 Node.js 桥接服务，将**企业微信智能机器人**直接连接到本地 **Hermes Agent CLI**。让企业微信里的每位用户都能通过文字消息，使用 Hermes 的完整本地工具能力：终端命令、文件操作、浏览器自动化、技能调用、定时任务等。
 
-> 🚨 **Why this exists:** OpenClaw's built-in bridge often routes to cloud LLMs with no tool access. This bridge spawns the local `hermes` binary so your team can actually run commands, edit files, and browse the web through WeChat messages.
-
----
-
-## Table of Contents
-
-- [Features](#features)
-- [Architecture](#architecture)
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Running](#running)
-- [Deployment (PM2)](#deployment-pm2)
-- [Commands](#commands)
-- [Troubleshooting](#troubleshooting)
-- [License](#license)
+> 🚨 **为什么要做这个：** OpenClaw 自带的桥接通常会把消息路由到云端大模型，而那些模型没有本地工具权限。这个桥接直接调用本地 `hermes` 二进制文件，真正让你的团队能在微信里跑命令、改文件、浏览网页。
 
 ---
 
-## Features
+## 目录
 
-- 💬 **Full Hermes tool access** via WeCom text messages
-- 🔐 **Per-user session memory** — multi-turn conversations just work
-- ⚡ **Typing / buffering indicator** so users know the agent is thinking
-- 🛠️ **ANSI & box-drawing cleanup** — Hermes' TUI output is stripped before sending
-- 🔄 **Auto-reconnect** WebSocket with configurable retry limits
-- 📅 **Session TTL** — stale sessions are automatically purged
+- [功能特性](#功能特性)
+- [架构](#架构)
+- [前置要求](#前置要求)
+- [安装](#安装)
+- [配置](#配置)
+- [运行](#运行)
+- [生产部署（PM2）](#生产部署pm2)
+- [使用命令](#使用命令)
+- [常见问题](#常见问题)
+- [开源协议](#开源协议)
 
 ---
 
-## Architecture
+## 功能特性
+
+- 💬 **完整 Hermes 工具能力**：通过企微文字消息调用本地 Agent 的全部工具
+- 🔐 **用户级会话记忆**：每个用户独立会话，多轮对话上下文自动保持
+- ⚡ **输入中/缓冲提示**：用户发送消息后，机器人会先提示“Hermes 正在思考...”
+- 🛠️ **自动清理 TUI 输出**：Hermes 的 ANSI 颜色、边框字符、装饰符号在发回微信前自动剥离
+- 🔄 **断线自动重连**：WebSocket 掉线后自动恢复，可配置重试次数
+- 📅 **会话自动过期**：内存中的用户会话支持 TTL，过期自动清理
+
+---
+
+## 架构
 
 ```
-WeCom User Message
+企业微信用户消息
         ↓
-@wecom/aibot-node-sdk (WebSocket)
+@wecom/aibot-node-sdk（WebSocket 长连接）
         ↓
-Node.js bridge (this repo)
+Node.js 桥接服务（本项目）
         ↓
-spawn("hermes", ["chat", "-q", query, "--yolo"])
+spawn("hermes", ["chat", "-q", "用户问题", "--yolo"])
         ↓
-Hermes Agent (local CLI with full tools)
+本地 Hermes Agent（拥有完整本地工具权限）
         ↓
-stdout → strip ANSI/borders → reply back through WS
+stdout → 剥离 ANSI/边框字符 → 通过 WS 回发给用户
 ```
 
 ---
 
-## Prerequisites
+## 前置要求
 
 - **Node.js** ≥ 18
-- **Hermes CLI** installed and on your `PATH`
-- A **WeCom Smart Bot** (智能机器人) with its `Bot ID` and `Secret`
-  - Get these from: 企业微信管理后台 → 应用管理 → 智能机器人 → 点击你的 Bot → 查看 `BotId` 和 `Secret`
+- **Hermes CLI** 已安装，并且能在命令行里直接执行 `hermes`
+- 一个 **企业微信智能机器人**，获取到 `BotId` 和 `Secret`
+  - 获取路径：企业微信管理后台 → 应用管理 → 智能机器人 → 点击进入你的机器人 → 查看 `BotId` 和 `Secret`
 
 ---
 
-## Installation
+## 安装
 
 ```bash
-# 1. Clone the repo
+# 1. 克隆仓库
 git clone https://github.com/MoringstarsH/wecom-Bot-hermes.git
 cd wecom-Bot-hermes
 
-# 2. Install dependencies (the SDK is vendored under ./vendor)
+# 2. 安装依赖（SDK 已内置在 vendor 目录，无需额外下载）
 npm install
 
-# 3. Create your environment file
+# 3. 复制环境变量模板
 cp .env.example .env
-# Edit .env and fill in WECOM_BOT_ID and WECOM_BOT_SECRET
+# 编辑 .env，填入 WECOM_BOT_ID 和 WECOM_BOT_SECRET
 ```
 
 ---
 
-## Configuration
+## 配置
 
-Edit `.env`:
+编辑 `.env` 文件：
 
 ```ini
 WECOM_BOT_ID=aib4Efhltb5TZYmg44lvGp5_JZK-daYSIwB
-WECOM_BOT_SECRET=your_secret_here
+WECOM_BOT_SECRET=你的机器人 Secret
 
-# Optional:
-HERMES_TIMEOUT_MS=300000      # Max time to wait for Hermes reply
-SESSION_TTL_MS=86400000       # How long to keep a user's session in memory
+# 可选配置：
+HERMES_TIMEOUT_MS=300000      # Hermes 最长响应等待时间（毫秒）
+SESSION_TTL_MS=86400000       # 用户会话在内存中的保留时间（毫秒）
 ```
 
 ---
 
-## Running
+## 运行
 
-### Dev / foreground
+### 开发/前台运行
 
 ```bash
 npm start
 ```
 
-You should see:
+正常运行时你会看到：
 
 ```
 [2026-04-16T12:00:00.000Z] Connecting to WeCom Bot aib4Ef...
 [2026-04-16T12:00:01.000Z] WeCom authenticated
 ```
 
-### Production (PM2)
+### 生产环境（PM2）
 
 ```bash
-# Create log directory first
+# 先创建日志目录
 mkdir -p logs
 
-# Start with PM2
+# 用 PM2 启动
 npm run pm2:start
 
-# View logs
+# 查看日志
 pm2 logs wecom-bot-hermes
 
-# Restart / stop
+# 重启 / 停止
 npm run pm2:restart
 npm run pm2:stop
 ```
 
-You can also register PM2 as a startup service:
+也可以把 PM2 注册为开机启动服务：
 
 ```bash
 pm2 startup
@@ -132,31 +132,31 @@ pm2 save
 
 ---
 
-## Commands
+## 使用命令
 
-Users can send these special commands in WeCom:
+用户在企业微信里可以发送以下特殊命令：
 
-| Command | Description |
-|---------|-------------|
-| `/clear` | Drop the current Hermes session and start fresh |
-| `/help`  | Show available commands |
+| 命令 | 说明 |
+|------|------|
+| `/clear` | 清空当前用户的 Hermes 会话，重新开始 |
+| `/help`  | 显示可用命令说明 |
 
-Everything else is routed straight to Hermes.
-
----
-
-## Troubleshooting
-
-| Symptom | Fix |
-|---------|-----|
-| `Authentication failed: 40058` | Double-check `WECOM_BOT_ID` and `WECOM_BOT_SECRET`. Regenerate the Secret in WeCom admin if unsure. |
-| `errcode=40008 invalid message type` | Make sure you are using a **Smart Bot (智能机器人)** and not a legacy group robot. |
-| Hermes reply looks garbled | The bridge already strips ANSI + box-drawing characters. If it still looks wrong, open an issue with a raw stdout sample. |
-| Context lost between messages | Verify that `--resume {sessionId}` is being used. The session store is in-memory, so restarting the bridge process clears all sessions. Users can type `/clear` to recover. |
-| Hermes times out on long tasks | Increase `HERMES_TIMEOUT_MS` in `.env`. Complex browser or build tasks may need 10+ minutes. |
+其他所有文字都会直接路由给 Hermes Agent 处理。
 
 ---
 
-## License
+## 常见问题
+
+| 现象 | 解决办法 |
+|------|---------|
+| `Authentication failed: 40058` | 仔细检查 `WECOM_BOT_ID` 和 `WECOM_BOT_SECRET` 是否填对。如果不确定，去企业微信后台重新生成 Secret。 |
+| `errcode=40008 invalid message type` | 请确认你使用的是**智能机器人**，而不是旧版的群机器人。 |
+| Hermes 回复看起来是乱码/ASCII 艺术 | 桥接脚本已经做了 ANSI 和边框字符清理。如果仍然有问题，请带上一段原始 stdout 来提 issue。 |
+| 多轮对话上下文丢失 | 检查是否使用了 `--resume {sessionId}`。会话目前保存在内存中，重启桥接服务会清空所有会话，用户可以发送 `/clear` 恢复。 |
+| Hermes 执行复杂任务超时 | 在 `.env` 里增大 `HERMES_TIMEOUT_MS`。涉及浏览器操作或编译构建的任务可能需要 10 分钟以上。 |
+
+---
+
+## 开源协议
 
 MIT
