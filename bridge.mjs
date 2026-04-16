@@ -1,7 +1,7 @@
 import { WSClient, generateReqId } from '@wecom/aibot-node-sdk';
 import { spawn } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
-import { dirname, resolve } from 'path';
+import { basename, dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -68,7 +68,6 @@ function extractHermesReply(raw) {
   const resumeIndex = clean.lastIndexOf('Resume this session with:');
   if (resumeIndex !== -1) {
     let fallback = clean.slice(0, resumeIndex).trim();
-    // 去掉可能的 Hermes 标题行
     fallback = fallback.replace(/^(?:\u2695\s*)?Hermes\s*\n+/, '').trim();
     fallback = fallback
       .split('\n')
@@ -85,6 +84,18 @@ function extractHermesReply(raw) {
   }
 
   return { sessionId: null, reply: null };
+}
+
+// ====== 从回复中提取 MEDIA: 图片路径 ======
+function extractMediaPaths(text) {
+  const mediaPaths = [];
+  const cleaned = text.replace(/MEDIA:([^\s\n]+)/g, (match, p1) => {
+    if (existsSync(p1)) mediaPaths.push(p1);
+    return '';
+  });
+  // 清理因移除 MEDIA 产生的多余空行
+  const finalText = cleaned.replace(/\n{3,}/g, '\n\n').trim();
+  return { text: finalText, mediaPaths };
 }
 
 // ====== 会话存储（带过期时间的内存缓存） ======
@@ -154,7 +165,6 @@ function isDuplicate(msgid) {
   return false;
 }
 
-// 每 60 秒清理一次过期去重记录
 setInterval(() => {
   const now = Date.now();
   for (const [id, ts] of recentMessages) {
@@ -181,7 +191,6 @@ function callHermes(userid, query) {
 
     const timer = setTimeout(() => {
       child.kill('SIGTERM');
-      // 5 秒后强制终止，防止进程变孤儿进程
       setTimeout(() => {
         if (!child.killed) child.kill('SIGKILL');
       }, 5_000);
@@ -200,6 +209,22 @@ function callHermes(userid, query) {
       }
     });
   });
+}
+
+// ====== 发送图片消息 ======
+async function sendMediaReplies(ws, frame, mediaPaths) {
+  for (const path of mediaPaths) {
+    try {
+      const buffer = readFileSync(path);
+      const filename = basename(path);
+      const result = await ws.uploadMedia(buffer, { type: 'image', filename });
+      await ws.replyMedia(frame, 'image', result.media_id);
+    } catch (e) {
+      console.error('发送图片失败:', path, e.message);
+      // 如果上传失败，回退为文字提示
+      await ws.replyStream(frame, generateReqId('stream'), `[图片发送失败: ${path}]`, true);
+    }
+  }
 }
 
 // ====== 企业微信 WebSocket 客户端 ======
@@ -271,8 +296,17 @@ wsClient.on('message', async (frame) => {
     const { sessionId, reply } = await enqueueHermes(userid, content);
     if (sessionId) userSessions.set(userid, sessionId);
 
-    // 发送最终回复
-    await wsClient.replyStream(frame, generateReqId('stream'), reply, true);
+    const { text, mediaPaths } = extractMediaPaths(reply);
+
+    // 先发送文字部分（如果有）
+    if (text) {
+      await wsClient.replyStream(frame, generateReqId('stream'), text, true);
+    }
+
+    // 再发送图片（如果有）
+    if (mediaPaths.length > 0) {
+      await sendMediaReplies(wsClient, frame, mediaPaths);
+    }
   } catch (err) {
     console.error('Hermes 调用错误:', err.message);
     try {
