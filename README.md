@@ -81,8 +81,8 @@ cp .env.example .env
 编辑 `.env` 文件：
 
 ```ini
-WECOM_BOT_ID=aib4Efhltb5TZYmg44lvGp5_JZK-daYSIwB
-WECOM_BOT_SECRET=你的机器人 Secret
+WECOM_BOT_ID=your_bot_id_here
+WECOM_BOT_SECRET=your_bot_secret_here
 
 # 可选配置：
 HERMES_TIMEOUT_MS=300000      # Hermes 最长响应等待时间（毫秒）
@@ -102,8 +102,8 @@ npm start
 正常运行时你会看到：
 
 ```
-[2026-04-16T12:00:00.000Z] Connecting to WeCom Bot aib4Ef...
-[2026-04-16T12:00:01.000Z] WeCom authenticated
+[2026-04-16T12:00:00.000Z] 正在连接企业微信机器人 ...
+[2026-04-16T12:00:01.000Z] 企业微信认证成功
 ```
 
 ### 生产环境（PM2）

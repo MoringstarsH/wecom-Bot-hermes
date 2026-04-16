@@ -1,7 +1,7 @@
 {
   "name": "wecom-bot-hermes",
   "version": "1.0.0",
-  "description": "WeCom (Enterprise WeChat) -> Hermes Agent local bridge. Enables full tool access (terminal, file, browser) via WeChat messages.",
+  "description": "企业微信智能机器人 -> Hermes 本地代理桥接。让企业微信用户通过文字消息使用 Hermes 的完整本地工具能力（终端、文件、浏览器、技能等）。",
   "type": "module",
   "main": "bridge.mjs",
   "scripts": {
@@ -17,7 +17,10 @@
     "hermes",
     "ai-agent",
     "bridge",
-    "bot"
+    "bot",
+    "企业微信",
+    "智能机器人",
+    "本地代理"
   ],
   "author": "MoringstarsH",
   "license": "MIT",
