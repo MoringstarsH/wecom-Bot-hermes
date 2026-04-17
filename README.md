@@ -90,7 +90,6 @@ WECOM_BOT_SECRET=your_bot_secret_here
 ALLOWED_USERIDS=zhangsan,lisi # 允许调用机器人的企业微信用户 ID（逗号分隔）
 
 # 可选配置：
-HERMES_TIMEOUT_MS=300000       # Hermes 最长响应等待时间（毫秒）
 SESSION_TTL_MS=86400000        # 用户会话在内存中的保留时间（毫秒）
 HERMES_ENABLE_YOLO=false       # 是否给 Hermes 附加 --yolo（默认 false）
 MEDIA_BASE_DIR=./media         # 允许发送媒体文件的根目录
@@ -163,7 +162,7 @@ pm2 save
 | `errcode=40008 invalid message type` | 请确认你使用的是**智能机器人**，而不是旧版的群机器人。 |
 | Hermes 回复看起来是乱码/ASCII 艺术 | 桥接脚本已经做了 ANSI 和边框字符清理。如果仍然有问题，请带上一段原始 stdout 来提 issue。 |
 | 多轮对话上下文丢失 | 检查是否使用了 `--resume {sessionId}`。会话目前保存在内存中，重启桥接服务会清空所有会话，用户可以发送 `/clear` 恢复。 |
-| Hermes 执行复杂任务超时 | 在 `.env` 里增大 `HERMES_TIMEOUT_MS`。涉及浏览器操作或编译构建的任务可能需要 10 分钟以上。 |
+| Hermes 执行复杂任务超时 | 桥接层采用双层超时机制：5分钟时会推送「任务仍在执行」状态，15分钟时会强制中断并告知用户。若任务在5~15分钟内完成，结果会自动推送到企微。 |
 
 ---
 

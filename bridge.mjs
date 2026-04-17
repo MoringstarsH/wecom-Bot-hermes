@@ -54,10 +54,8 @@ function parseCsvToSet(value) {
   );
 }
 
-const HERMES_TIMEOUT_MS = parsePositiveInt('HERMES_TIMEOUT_MS', 300_000, {
-  min: 1_000,
-  max: 30 * 60 * 1000,
-});
+const SOFT_TIMEOUT_MS = 5 * 60 * 1000;   // 5分钟：状态检查，任务仍在执行
+const HARD_TIMEOUT_MS = 15 * 60 * 1000;  // 15分钟：强制中断任务
 const SESSION_TTL_MS = parsePositiveInt('SESSION_TTL_MS', 24 * 60 * 60 * 1000, {
   min: 60_000,
   max: 30 * 24 * 60 * 60 * 1000,
@@ -381,7 +379,7 @@ async function processQueue(userid) {
         );
       }
 
-      const result = await callHermes(userid, item.query);
+      const result = await callHermes(userid, item.query, item.context);
       item.resolve(result);
     } catch (err) {
       item.reject(err);
@@ -435,7 +433,7 @@ class HermesBridgeError extends Error {
 }
 
 // ====== 调用本地 Hermes CLI ======
-function callHermes(userid, query) {
+function callHermes(userid, query, context) {
   return new Promise((resolve, reject) => {
     const sessionId = userSessions.get(userid);
     const args = sessionId ? ['--resume', sessionId, 'chat', '-q', query] : ['chat', '-q', query];
@@ -450,36 +448,82 @@ function callHermes(userid, query) {
     child.stdout.on('data', (d) => (stdout += d.toString()));
     child.stderr.on('data', (d) => (stdout += d.toString()));
 
-    const timer = setTimeout(() => {
+    let softTimeoutFired = false;
+    let resolved = false;
+
+    const softTimer = setTimeout(() => {
+      softTimeoutFired = true;
+      if (context?.ws && context?.frame) {
+        context.ws.replyStream(
+          context.frame,
+          generateReqId('stream'),
+          'Hermes 仍在努力执行中，任务尚未完成。\n\n你可以稍后发送「是否执行完毕」来查询结果。',
+          true
+        ).catch((e) => console.error('软超时状态消息发送失败:', e.message));
+      }
+    }, SOFT_TIMEOUT_MS);
+
+    const hardTimer = setTimeout(() => {
       child.kill('SIGTERM');
       setTimeout(() => {
         if (!child.killed) child.kill('SIGKILL');
       }, 5_000);
-      reject(
-        new HermesBridgeError(
-          'Hermes 响应超时，请稍后重试。',
-          `Hermes timeout after ${HERMES_TIMEOUT_MS}ms for user ${userid}`
-        )
-      );
-    }, HERMES_TIMEOUT_MS);
+      if (!resolved) {
+        resolved = true;
+        reject(
+          new HermesBridgeError(
+            '任务执行超时（超过15分钟），已被中断，请重新发起任务。',
+            `Hermes hard timeout after ${HARD_TIMEOUT_MS}ms for user ${userid}`
+          )
+        );
+      }
+    }, HARD_TIMEOUT_MS);
 
     child.on('error', (err) => {
-      clearTimeout(timer);
-      reject(
-        new HermesBridgeError(
-          'Hermes 服务不可用，请联系管理员。',
-          `Hermes spawn error for user ${userid}: ${err.message}`
-        )
-      );
+      clearTimeout(softTimer);
+      clearTimeout(hardTimer);
+      if (!resolved) {
+        resolved = true;
+        reject(
+          new HermesBridgeError(
+            'Hermes 服务不可用，请联系管理员。',
+            `Hermes spawn error for user ${userid}: ${err.message}`
+          )
+        );
+      }
     });
 
     child.on('close', (code) => {
-      clearTimeout(timer);
+      clearTimeout(softTimer);
+      clearTimeout(hardTimer);
+      if (resolved) return;
+
       const { sessionId: sid, reply, mediaPaths } = extractHermesReply(stdout);
 
+      if (softTimeoutFired && context?.ws && context?.frame && (reply || mediaPaths.length > 0)) {
+        // 软超时后任务完成，主动推送结果
+        (async () => {
+          try {
+            if (reply) {
+              await context.ws.replyStream(context.frame, generateReqId('stream'), reply, true);
+            }
+            if (mediaPaths.length > 0) {
+              await sendMediaReplies(context.ws, context.frame, mediaPaths);
+            }
+          } catch (e) {
+            console.error('后台结果推送失败:', e.message);
+          }
+        })();
+        resolved = true;
+        resolve({ sessionId: sid, reply: '', mediaPaths: [] });
+        return;
+      }
+
       if (reply || mediaPaths.length > 0) {
+        resolved = true;
         resolve({ sessionId: sid, reply, mediaPaths });
       } else {
+        resolved = true;
         const tail = stdout.slice(-800).trim();
         reject(
           new HermesBridgeError(
