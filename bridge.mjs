@@ -11,12 +11,22 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // ====== 配置读取 ======
 function loadEnv(path = resolve(__dirname, '.env')) {
   if (!existsSync(path)) return;
-  const text = readFileSync(path, 'utf-8');
+  // 去掉 Windows 记事本/PowerShell 保存时常见的 UTF-8 BOM，避免首行键名匹配失败
+  const text = readFileSync(path, 'utf-8').replace(/^\uFEFF/, '');
   for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
     const m = line.match(/^\s*([A-Za-z0-9_]+)\s*=\s*(.*?)\s*$/);
-    if (m && !Object.hasOwn(process.env, m[1])) {
-      process.env[m[1]] = m[2];
+    if (!m) continue;
+    if (Object.hasOwn(process.env, m[1])) continue;
+    let value = m[2];
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
     }
+    process.env[m[1]] = value;
   }
 }
 loadEnv();
@@ -70,6 +80,9 @@ const MAX_MEDIA_FILE_SIZE_BYTES = parsePositiveInt('MAX_MEDIA_FILE_SIZE_BYTES', 
 });
 const ALLOWED_MEDIA_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
 const MAX_GLOBAL_CONCURRENCY = parsePositiveInt('MAX_GLOBAL_CONCURRENCY', 15, { min: 1, max: 50 });
+const IS_WINDOWS = process.platform === 'win32';
+const HERMES_BIN = process.env.HERMES_BIN || (IS_WINDOWS ? 'hermes.cmd' : 'hermes');
+const WECOM_STREAM_MAX_BYTES = 20000;
 
 if (!BOT_ID || !BOT_SECRET) {
   console.error('缺少环境变量 WECOM_BOT_ID 或 WECOM_BOT_SECRET');
@@ -132,17 +145,33 @@ function isAuthorizedUser(userid) {
 }
 
 // ====== ANSI 颜色码与边框字符清理工具 ======
-const ANSI_PATTERN = /\x1B\[[0-9;]*[mGKHFfnsut]/g;
+const ANSI_CSI_PATTERN = /\x1B\[[0-?]*[ -/]*[@-~]/g;
+const ANSI_OSC_PATTERN = /\x1B\][\s\S]*?(?:\x07|\x1B\\)/g;
+const ANSI_SIMPLE_PATTERN = /\x1B[@-_]/g;
 const BOX_DRAWING_PATTERN = /[\u2500-\u257F\u2550-\u256C]/g;
 const ORNAMENT_PATTERN = /[\u26a1\u2728\u2b50\u2605\u2606\u25cf\u25cb\u2713\u2714\u2717\u2718]/g;
 const BRAILLE_BLANK = /\u2800/g;
 
 function stripFormatting(str) {
   return str
-    .replace(ANSI_PATTERN, '')
+    .replace(ANSI_OSC_PATTERN, '')
+    .replace(ANSI_CSI_PATTERN, '')
+    .replace(ANSI_SIMPLE_PATTERN, '')
     .replace(BOX_DRAWING_PATTERN, '')
     .replace(ORNAMENT_PATTERN, '')
     .replace(BRAILLE_BLANK, ' ');
+}
+
+function truncateForWecom(text, maxBytes = WECOM_STREAM_MAX_BYTES) {
+  if (!text) return text || '';
+  const buf = Buffer.from(text, 'utf8');
+  if (buf.length <= maxBytes) return text;
+  const suffix = '\n\n…（内容过长已截断，完整结果请查看本地日志）';
+  const suffixBytes = Buffer.byteLength(suffix, 'utf8');
+  const budget = Math.max(0, maxBytes - suffixBytes);
+  let end = budget;
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
+  return buf.slice(0, end).toString('utf8') + suffix;
 }
 
 function isPathInside(baseDir, targetPath) {
@@ -240,6 +269,20 @@ function removeMediaMarkers(text) {
   return result.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
+function dedentCommon(text) {
+  const lines = text.split('\n');
+  let minIndent = Infinity;
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const m = line.match(/^(\s*)/);
+    const indent = m ? m[1].length : 0;
+    if (indent < minIndent) minIndent = indent;
+    if (minIndent === 0) break;
+  }
+  if (!Number.isFinite(minIndent) || minIndent === 0) return text;
+  return lines.map((line) => line.slice(minIndent)).join('\n');
+}
+
 function extractHermesReply(raw) {
   const clean = stripFormatting(raw);
   const mediaPaths = extractMediaPaths(clean);
@@ -252,11 +295,7 @@ function extractHermesReply(raw) {
   );
   let reply = replyMatch ? replyMatch[1] : null;
   if (reply) {
-    reply = reply
-      .split('\n')
-      .map((l) => l.replace(/^(\s{3,})/, ''))
-      .join('\n')
-      .trim();
+    reply = dedentCommon(reply).trim();
     return { sessionId, reply: removeMediaMarkers(reply), mediaPaths };
   }
 
@@ -264,11 +303,7 @@ function extractHermesReply(raw) {
   if (resumeIndex !== -1) {
     let fallback = clean.slice(0, resumeIndex).trim();
     fallback = fallback.replace(/^(?:\u2695\s*)?Hermes\s*\n+/, '').trim();
-    fallback = fallback
-      .split('\n')
-      .map((l) => l.replace(/^(\s{3,})/, ''))
-      .join('\n')
-      .trim();
+    fallback = dedentCommon(fallback).trim();
     if (fallback) return { sessionId, reply: removeMediaMarkers(fallback), mediaPaths };
   }
 
@@ -356,38 +391,44 @@ async function processQueue(userid) {
   const queue = userQueues.get(userid);
   if (!queue || queue.processing) return;
   queue.processing = true;
-  while (queue.length > 0) {
-    const item = queue.shift();
-    let notifiedWaiting = false;
-    try {
-      if (activeGlobalCount >= MAX_GLOBAL_CONCURRENCY) {
-        await item.context.ws.replyStream(
-          item.context.frame,
-          generateReqId('stream'),
-          '当前请求较多，正在排队，请稍候...',
-          true
-        );
-        notifiedWaiting = true;
-      }
-      await acquireGlobalSlot();
-      if (notifiedWaiting) {
-        await item.context.ws.replyStream(
-          item.context.frame,
-          generateReqId('stream'),
-          '排队到你啦，正在做你的请求...',
-          false
-        );
-      }
+  try {
+    while (queue.length > 0) {
+      const item = queue.shift();
+      let notifiedWaiting = false;
+      try {
+        if (activeGlobalCount >= MAX_GLOBAL_CONCURRENCY) {
+          await item.context.ws.replyStream(
+            item.context.frame,
+            generateReqId('stream'),
+            '当前请求较多，正在排队，请稍候...',
+            true
+          );
+          notifiedWaiting = true;
+        }
+        await acquireGlobalSlot();
+        if (notifiedWaiting) {
+          await item.context.ws.replyStream(
+            item.context.frame,
+            generateReqId('stream'),
+            '排队到你啦，正在做你的请求...',
+            false
+          );
+        }
 
-      const result = await callHermes(userid, item.query, item.context);
-      item.resolve(result);
-    } catch (err) {
-      item.reject(err);
-    } finally {
-      releaseGlobalSlot();
+        const result = await callHermes(userid, item.query, item.context);
+        item.resolve(result);
+      } catch (err) {
+        item.reject(err);
+      } finally {
+        releaseGlobalSlot();
+      }
+    }
+  } finally {
+    queue.processing = false;
+    if (queue.length === 0 && userQueues.get(userid) === queue) {
+      userQueues.delete(userid);
     }
   }
-  queue.processing = false;
 }
 
 function enqueueHermes(userid, query, context) {
@@ -416,12 +457,13 @@ function isDuplicate(msgid) {
   return false;
 }
 
-setInterval(() => {
+const dedupCleanupTimer = setInterval(() => {
   const now = Date.now();
   for (const [id, ts] of recentMessages) {
     if (now - ts > DEDUP_TTL_MS) recentMessages.delete(id);
   }
 }, DEDUP_TTL_MS);
+if (typeof dedupCleanupTimer.unref === 'function') dedupCleanupTimer.unref();
 
 class HermesBridgeError extends Error {
   constructor(userMessage, logDetail = '') {
@@ -439,9 +481,11 @@ function callHermes(userid, query, context) {
     const args = sessionId ? ['--resume', sessionId, 'chat', '-q', query] : ['chat', '-q', query];
     if (HERMES_ENABLE_YOLO) args.push('--yolo');
 
-    const child = spawn('hermes', args, {
+    const child = spawn(HERMES_BIN, args, {
       env: { ...process.env, NO_COLOR: '1' },
       stdio: ['ignore', 'pipe', 'pipe'],
+      shell: IS_WINDOWS && /\.(cmd|bat|ps1)$/i.test(HERMES_BIN),
+      windowsHide: true,
     });
 
     let stdout = '';
@@ -505,7 +549,12 @@ function callHermes(userid, query, context) {
         (async () => {
           try {
             if (reply) {
-              await context.ws.replyStream(context.frame, generateReqId('stream'), reply, true);
+              await context.ws.replyStream(
+                context.frame,
+                generateReqId('stream'),
+                truncateForWecom(reply),
+                true
+              );
             }
             if (mediaPaths.length > 0) {
               await sendMediaReplies(context.ws, context.frame, mediaPaths);
@@ -734,7 +783,7 @@ wsClient.on('message', async (frame) => {
 
     // 先发送文字部分（如果有）
     if (reply) {
-      await wsClient.replyStream(frame, generateReqId('stream'), reply, true);
+      await wsClient.replyStream(frame, generateReqId('stream'), truncateForWecom(reply), true);
     }
 
     // 再发送图片（如果有）
